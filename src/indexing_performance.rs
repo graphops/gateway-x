@@ -1,4 +1,8 @@
-use std::{collections::HashMap, ops::Deref, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    time::{Duration, Instant},
+};
 
 use parking_lot::RwLock;
 use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::BlockNumber};
@@ -9,7 +13,22 @@ use crate::network::NetworkService;
 #[derive(Default)]
 pub struct Snapshot {
     pub response: indexer_selection::Performance,
+    /// The highest block the indexer has been observed to have indexed.
     pub latest_block: Option<BlockNumber>,
+    /// When `latest_block` was last observed, either in a query response or a status poll.
+    pub observed_at: Option<Instant>,
+}
+
+impl Snapshot {
+    /// Record that the indexer reported `block` at `at`. A report at or above the known block
+    /// refreshes the observation time, so an indexer that keeps up looks fresh even when it is
+    /// rarely queried. A lower report is ignored.
+    fn observe(&mut self, block: BlockNumber, at: Instant) {
+        if self.latest_block.is_none_or(|latest| block >= latest) {
+            self.latest_block = Some(block);
+            self.observed_at = Some(at);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +124,7 @@ impl Actor {
     }
 
     fn handle_msgs(&mut self, msgs: &mut Vec<Feedback>) {
+        let now = Instant::now();
         for unlocked in &self.data.0 {
             let mut locked = unlocked.write();
             for &Feedback {
@@ -117,11 +137,9 @@ impl Actor {
             {
                 let snapshot = locked.entry((indexer, deployment)).or_default();
                 snapshot.response.feedback(success, latency_ms);
-                snapshot.latest_block = match (snapshot.latest_block, latest_block) {
-                    (None, block) => block,
-                    (Some(a), Some(b)) if b > a => Some(b),
-                    (Some(a), _) => Some(a),
-                };
+                if let Some(block) = latest_block {
+                    snapshot.observe(block, now);
+                }
             }
         }
         msgs.clear();
@@ -129,15 +147,14 @@ impl Actor {
 
     fn handle_network(&mut self, network: &NetworkService) {
         let progress = network.indexing_progress();
+        let now = Instant::now();
         for unlocked in &self.data.0 {
             let mut locked = unlocked.write();
             for (indexing, latest_block) in progress.iter() {
                 let snapshot = locked
                     .entry((indexing.indexer, indexing.deployment))
                     .or_default();
-                if *latest_block >= snapshot.latest_block.unwrap_or(0) {
-                    snapshot.latest_block = Some(*latest_block);
-                };
+                snapshot.observe(*latest_block, now);
             }
         }
     }
@@ -181,5 +198,39 @@ mod feedback_tests {
                 assert_eq!(actual.success_rate, expected.success_rate);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn reports_at_or_above_the_known_block_refresh_the_observation_time() {
+        let start = Instant::now();
+        let mut snapshot = Snapshot::default();
+        snapshot.observe(100, start);
+        assert_eq!(snapshot.latest_block, Some(100));
+        assert_eq!(snapshot.observed_at, Some(start));
+
+        let later = start + Duration::from_secs(30);
+        snapshot.observe(100, later);
+        assert_eq!(snapshot.latest_block, Some(100));
+        assert_eq!(snapshot.observed_at, Some(later));
+
+        let latest = later + Duration::from_secs(30);
+        snapshot.observe(105, latest);
+        assert_eq!(snapshot.latest_block, Some(105));
+        assert_eq!(snapshot.observed_at, Some(latest));
+    }
+
+    #[test]
+    fn a_lower_report_keeps_the_known_block_and_its_observation_time() {
+        let start = Instant::now();
+        let mut snapshot = Snapshot::default();
+        snapshot.observe(100, start);
+        snapshot.observe(90, start + Duration::from_secs(30));
+        assert_eq!(snapshot.latest_block, Some(100));
+        assert_eq!(snapshot.observed_at, Some(start));
     }
 }

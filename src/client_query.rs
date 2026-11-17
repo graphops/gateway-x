@@ -502,6 +502,7 @@ fn build_candidates_list(
 
     // Lock the indexing performance and get access to the latest performance snapshots
     let perf_snapshots = ctx.indexing_perf.latest();
+    let now = Instant::now();
 
     for (indexing_id, indexing) in indexings {
         // If the indexer is not available, register an error and continue to the next indexer
@@ -521,8 +522,15 @@ fn build_candidates_list(
         // If the indexer is not available, register an error and continue to the next indexer
         let perf = match perf_snapshots
             .get(&(indexing_id.indexer, indexing_id.deployment))
-            .and_then(|snapshot| perf(snapshot, block_requirements, chain_head, blocks_per_minute))
-        {
+            .and_then(|snapshot| {
+                perf(
+                    snapshot,
+                    block_requirements,
+                    chain_head,
+                    blocks_per_minute,
+                    now,
+                )
+            }) {
             Some(perf) => perf,
             None => {
                 candidates_errors.insert(
@@ -612,18 +620,34 @@ struct Perf {
     seconds_behind: u32,
 }
 
+/// The most time since an indexer's progress was last observed that [`perf`] will assume the
+/// indexer kept pace with the chain. A rarely queried indexer's progress is refreshed only by the
+/// network status poll, every 30s plus the time a poll takes, so this covers one poll cycle. An
+/// indexer that has stalled can look fresh for at most this long.
+const MAX_ASSUMED_PROGRESS: Duration = Duration::from_secs(60);
+
 fn perf(
     snapshot: &indexing_performance::Snapshot,
     block_requirements: &BlockRequirements,
     chain_head: BlockNumber,
     blocks_per_minute: u64,
+    now: Instant,
 ) -> Option<Perf> {
     let latest_block = snapshot.latest_block?;
     let seconds_behind = if !block_requirements.latest || (blocks_per_minute == 0) {
         0
     } else {
-        ((chain_head.saturating_sub(latest_block) as f64 / blocks_per_minute as f64) * 60.0).ceil()
-            as u32
+        let lag =
+            (chain_head.saturating_sub(latest_block) as f64 / blocks_per_minute as f64) * 60.0;
+        // The chain head is current, but `latest_block` may have been observed a while ago. Assume
+        // the indexer kept pace since then, so the time since it was last observed isn't counted
+        // as lag.
+        let unobserved = snapshot
+            .observed_at
+            .map(|observed_at| now.saturating_duration_since(observed_at))
+            .unwrap_or_default()
+            .min(MAX_ASSUMED_PROGRESS);
+        (lag - unobserved.as_secs_f64()).max(0.0).ceil() as u32
     };
 
     let mut response = snapshot.response.expected_performance();
@@ -1037,5 +1061,93 @@ mod observed_progress_tests {
                 }));
             assert_eq!(reported_latest_block(&Err(error)), latest);
         }
+    }
+
+    fn latest_requirements() -> BlockRequirements {
+        BlockRequirements {
+            range: None,
+            number_gte: None,
+            latest: true,
+        }
+    }
+
+    fn snapshot(latest_block: BlockNumber, observed_at: Instant) -> indexing_performance::Snapshot {
+        indexing_performance::Snapshot {
+            response: Default::default(),
+            latest_block: Some(latest_block),
+            observed_at: Some(observed_at),
+        }
+    }
+
+    #[test]
+    fn time_since_progress_was_observed_is_not_counted_as_lag() {
+        // 5 blocks per minute: 12s per block. The indexer was at chain head when last observed,
+        // 30s ago; the chain has moved 2 blocks (24s) since.
+        let observed_at = Instant::now();
+        let now = observed_at + Duration::from_secs(30);
+        let perf = perf(
+            &snapshot(100, observed_at),
+            &latest_requirements(),
+            102,
+            5,
+            now,
+        )
+        .unwrap();
+        assert_eq!(perf.seconds_behind, 0);
+        assert_eq!(perf.latest_block, 100);
+    }
+
+    #[test]
+    fn lag_at_observation_time_is_kept() {
+        // 12 blocks (144s) behind head now, last observed 30s ago.
+        let observed_at = Instant::now();
+        let now = observed_at + Duration::from_secs(30);
+        let perf = perf(
+            &snapshot(100, observed_at),
+            &latest_requirements(),
+            112,
+            5,
+            now,
+        )
+        .unwrap();
+        assert_eq!(perf.seconds_behind, 144 - 30);
+    }
+
+    #[test]
+    fn a_stalled_indexer_is_assumed_to_keep_pace_only_briefly() {
+        // Last observed 10 minutes ago, 50 blocks behind now: only the cap is credited.
+        let observed_at = Instant::now();
+        let now = observed_at + Duration::from_secs(600);
+        let perf = perf(
+            &snapshot(100, observed_at),
+            &latest_requirements(),
+            150,
+            5,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            perf.seconds_behind,
+            600 - MAX_ASSUMED_PROGRESS.as_secs() as u32
+        );
+    }
+
+    #[test]
+    fn queries_at_a_fixed_block_are_not_penalized_for_lag() {
+        let observed_at = Instant::now();
+        let requirements = BlockRequirements {
+            range: Some((50, 50)),
+            number_gte: None,
+            latest: false,
+        };
+        let perf = perf(
+            &snapshot(100, observed_at),
+            &requirements,
+            150,
+            5,
+            observed_at,
+        )
+        .unwrap();
+        assert_eq!(perf.seconds_behind, 0);
     }
 }
